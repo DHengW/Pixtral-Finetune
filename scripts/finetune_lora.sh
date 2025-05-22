@@ -14,15 +14,15 @@ deepspeed src/training/train.py \
     --lora_enable True \
     --vision_lora False \
     --use_dora False \
-    --lora_rank 64 \
-    --lora_alpha 128 \
+    --lora_rank 128 \
+    --lora_alpha 256 \
     --lora_dropout 0.05 \
     --lora_namespan_exclude "['lm_head', 'embed_tokens']" \
     --num_lora_modules -1 \
     --deepspeed scripts/zero3.json \
     --model_id $MODEL_NAME \
-    --data_path data/teamix-aicrowd/index_aug_image_rerank_dataset/data_json.json \
-    --image_folder data/teamix-aicrowd/index_aug_image_rerank_dataset/path/ \
+    --data_path data/s1_dataset/s1_v1.json \
+    --image_folder data/s1_dataset/ \
     --disable_flash_attn2 True \
     --tune_img_projector True \
     --freeze_vision_tower True \
@@ -32,7 +32,7 @@ deepspeed src/training/train.py \
     --output_dir output/test_lora \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps 1 \
     --learning_rate 1e-4 \
     --projector_lr 1e-5 \
     --vision_lr 2e-6 \

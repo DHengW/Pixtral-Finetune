@@ -35,25 +35,53 @@ def find_target_linear_names(model, num_lora_modules=-1, lora_namespan_exclude=[
     return lora_module_names
 
 def set_requires_grad(parameters, requires_grad):
-    for p in parameters:
-        p.requires_grad = requires_grad
+    total_params = 0
+    trainable_params = 0
+    skipped_params = []
+    
+    for name, p in parameters:
+        total_params += 1
+        # Only set requires_grad for floating point and complex tensors
+        if p.dtype.is_floating_point or p.dtype.is_complex:
+            p.requires_grad = requires_grad
+            if requires_grad:
+                trainable_params += 1
+        else:
+            skipped_params.append((name, p.dtype))
+    
+    if skipped_params:
+        rank0_print(f"Warning: Skipped {len(skipped_params)} parameters that are not floating point or complex.")
+        for name, dtype in skipped_params[:10]:  # Print first 10 skipped params
+            rank0_print(f"  - Skipped: {name} (dtype: {dtype})")
+        if len(skipped_params) > 10:
+            rank0_print(f"  - ... and {len(skipped_params) - 10} more")
+    
+    trainable_ratio = trainable_params / total_params * 100 if total_params > 0 else 0
+    rank0_print(f"Trainable parameters: {trainable_params}/{total_params} ({trainable_ratio:.2f}%)")
+    return trainable_params, total_params
 
 def configure_vision_tower(model, training_args, compute_dtype, device):
     vision_tower = model.vision_tower
     vision_tower.to(dtype=compute_dtype, device=device)
 
-    img_projection_params = model.multi_modal_projector.parameters()
-    set_requires_grad(img_projection_params, training_args.tune_img_projector)
+    rank0_print("Configuring multi-modal projector parameters...")
+    img_projection_params = list(model.multi_modal_projector.named_parameters())
+    trainable_proj, total_proj = set_requires_grad(img_projection_params, training_args.tune_img_projector)
+    rank0_print(f"Projector parameters: {trainable_proj}/{total_proj} are trainable")
 
-    vision_model_params = vision_tower.parameters()
-    set_requires_grad(vision_model_params, not training_args.freeze_vision_tower)
+    rank0_print("Configuring vision tower parameters...")
+    vision_model_params = list(vision_tower.named_parameters())
+    trainable_vision, total_vision = set_requires_grad(vision_model_params, not training_args.freeze_vision_tower)
+    rank0_print(f"Vision tower parameters: {trainable_vision}/{total_vision} are trainable")
 
     if training_args.bits in [4, 8]:
         model.multi_modal_projector.to(dtype=compute_dtype, device=device)
 
 def configure_llm(model, training_args):
-    llm_params = model.language_model.parameters()
-    set_requires_grad(llm_params, not training_args.freeze_llm)
+    rank0_print("Configuring LLM parameters...")
+    llm_params = list(model.language_model.named_parameters())
+    trainable, total = set_requires_grad(llm_params, not training_args.freeze_llm)
+    rank0_print(f"LLM parameters: {trainable}/{total} are trainable")
 
 def module_filter_fn(mod: torch.nn.Module, fqn: str):
     # don't convert the last module
@@ -92,21 +120,40 @@ def train():
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
+    # Check for DeepSpeed Zero-3 configuration
+    import json
+    is_zero3 = False
+    if training_args.deepspeed:
+        with open(training_args.deepspeed, 'r') as f:
+            ds_config = json.load(f)
+            if 'zero_optimization' in ds_config and 'stage' in ds_config['zero_optimization']:
+                if ds_config['zero_optimization']['stage'] == 3:
+                    is_zero3 = True
+                    rank0_print("DeepSpeed Zero-3 detected. Disabling device_map.")
+
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4,8]:
-        bnb_model_from_pretrained_args.update(dict(
-            device_map={"":training_args.device},
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=training_args.bits==4,
-                load_in_8bit=training_args.bits==8,
-                llm_int8_skip_modules=["multi_modal_projector", "vision_tower"],
-                llm_int8_threshold=6.0,
-                llm_int8_has_fp16_weight=False,
-                bnb_4bit_compute_dtype=compute_dtype,
-                bnb_4bit_use_double_quant=training_args.double_quant,
-                bnb_4bit_quant_type=training_args.quant_type,
-            )
-        ))
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=training_args.bits==4,
+            load_in_8bit=training_args.bits==8,
+            llm_int8_skip_modules=["multi_modal_projector", "vision_tower"],
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=False,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=training_args.double_quant,
+            bnb_4bit_quant_type=training_args.quant_type,
+        )
+        
+        # Only add device_map if not using Zero-3
+        if not is_zero3:
+            bnb_model_from_pretrained_args.update(dict(
+                device_map={"":training_args.device},
+                quantization_config=quantization_config
+            ))
+        else:
+            bnb_model_from_pretrained_args.update(dict(
+                quantization_config=quantization_config
+            ))
 
     model = LlavaForConditionalGeneration.from_pretrained(
         model_args.model_id,
@@ -120,6 +167,17 @@ def train():
     model_to_configure = model
     configure_llm(model_to_configure, training_args)
     configure_vision_tower(model_to_configure, training_args, compute_dtype, training_args.device)
+
+    # 打印整个模型的可训练参数统计
+    total_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    rank0_print(f"===== 模型参数统计 =====")
+    rank0_print(f"总参数量: {total_params:,}")
+    rank0_print(f"可训练参数量: {total_trainable_params:,}")
+    rank0_print(f"可训练参数比例: {total_trainable_params/total_params*100:.2f}%")
+    if training_args.lora_enable:
+        rank0_print(f"LoRA已启用，只有LoRA参数会被更新")
+    rank0_print(f"========================")
 
     # I set a hidden size for temporary use. This is to use the deepspeed.
     # I will find a proper way later.
