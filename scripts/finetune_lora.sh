@@ -21,7 +21,7 @@ deepspeed src/training/train.py \
     --num_lora_modules -1 \
     --deepspeed scripts/zero3.json \
     --model_id $MODEL_NAME \
-    --data_path data/s1_dataset/s1_v1.json \
+    --data_path data/s1_dataset/s1_v2.json \
     --image_folder data/s1_dataset/ \
     --disable_flash_attn2 True \
     --tune_img_projector True \
